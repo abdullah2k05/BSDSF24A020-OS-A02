@@ -6,6 +6,7 @@
  * v1.1.0 : adds the -l (long listing) option
  * v1.2.0 : default output is a multi-column (down then across) listing
  * v1.3.0 : adds the -x (horizontal / left-to-right) option
+ * v1.4.0 : directory entries are sorted alphabetically with qsort()
  *
  * Usage:
  *       $ ./bin/ls
@@ -340,6 +341,24 @@ static void print_horizontal(char **names, size_t count, size_t max_len,
 }
 
 /* ------------------------------------------------------------------ */
+/* v1.4.0: alphabetical sort                                           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Comparison routine handed to qsort().  It receives pointers to two
+ * elements of the array -- and since the array holds char *, each
+ * element is itself a char *, so the arguments are char **.
+ * Casting away the void and dereferencing once yields the two strings.
+ */
+static int compare_names(const void *a, const void *b)
+{
+    const char *const *sa = a;
+    const char *const *sb = b;
+
+    return strcmp(*sa, *sb);
+}
+
+/* ------------------------------------------------------------------ */
 /* core directory listing                                              */
 /* ------------------------------------------------------------------ */
 
@@ -387,6 +406,10 @@ void do_ls(const char *dir, enum display_mode mode)
     if (errno != 0)
         perror("readdir failed");
     closedir(dp);
+
+    /* --- sort alphabetically before anything is printed (v1.4.0) --- */
+    if (count > 1)
+        qsort(names, count, sizeof(char *), compare_names);
 
     /* --- first pass over the names: alignment widths + total blocks --- */
     if (long_format) {
