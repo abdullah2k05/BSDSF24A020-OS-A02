@@ -8,13 +8,15 @@
  * v1.3.0 : adds the -x (horizontal / left-to-right) option
  * v1.4.0 : directory entries are sorted alphabetically with qsort()
  * v1.5.0 : filenames are colourised by file type (ANSI escape codes)
+ * v1.6.0 : adds the -R (recursive listing) option
  *
  * Usage:
  *       $ ./bin/ls
  *       $ ./bin/ls -l
  *       $ ./bin/ls -x
+ *       $ ./bin/ls -R
  *       $ ./bin/ls -l src
- *       $ ./bin/ls -lx src
+ *       $ ./bin/ls -lRx src
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,16 +51,21 @@ enum display_mode {
 /* helpers                                                             */
 /* ------------------------------------------------------------------ */
 
-/* Join a directory path and an entry name into "dir/name". */
+/* Join a directory path and an entry name into "dir/name".
+ * A directory operand that already ends in '/' (e.g. "src/") must not grow a
+ * second one, otherwise -R would print headers like "src//sub:". */
 static char *build_path(const char *dir, const char *name)
 {
-    size_t len = strlen(dir) + strlen(name) + 2;
+    size_t dirlen = strlen(dir);
+    size_t len = dirlen + strlen(name) + 2;
     char *path = malloc(len);
+    int need_sep = (dirlen == 0 || dir[dirlen - 1] != '/');
+
     if (path == NULL) {
         perror("malloc");
         exit(EXIT_FAILURE);
     }
-    snprintf(path, len, "%s/%s", dir, name);
+    snprintf(path, len, "%s%s%s", dir, need_sep ? "/" : "", name);
     return path;
 }
 
@@ -457,7 +464,31 @@ static int compare_names(const void *a, const void *b)
 /* core directory listing                                              */
 /* ------------------------------------------------------------------ */
 
-void do_ls(const char *dir, enum display_mode mode)
+/*
+ * v1.6.0 -- section headers for ls -R (and for several directory operands).
+ * GNU ls separates every section from the previous one with a blank line,
+ * but never puts one before the very first line of output, so remember
+ * whether anything has been printed yet.
+ */
+static int section_started = 0;
+
+static void print_dir_header(const char *dir)
+{
+    if (section_started)
+        putchar('\n');
+    printf("%s:\n", dir);
+    section_started = 1;
+}
+
+/*
+ * List one directory.
+ *
+ * header   -- print the "dir:" banner first (recursive calls, or one of
+ *             several directory operands on the command line)
+ * recursive-- descend into every subdirectory after this one is shown
+ */
+void do_ls(const char *dir, enum display_mode mode,
+           int header, int recursive)
 {
     struct dirent *entry;
     DIR *dp = opendir(dir);
@@ -473,6 +504,9 @@ void do_ls(const char *dir, enum display_mode mode)
                 dir, strerror(errno));
         return;
     }
+
+    if (header)
+        print_dir_header(dir);
 
     /* --- read every (non-hidden) entry into a dynamic array of strings --- */
     errno = 0;
@@ -533,14 +567,43 @@ void do_ls(const char *dir, enum display_mode mode)
     } else if (count > 0) {
         print_columnar(dir, names, count, max_len, get_terminal_width());
     }
+    section_started = 1;
+
+    /*
+     * Third pass: descend into every subdirectory, in the same sorted
+     * order the entries were printed in (v1.6.0).
+     *
+     * "names" holds nothing that starts with '.', so "." and ".." can
+     * never be revisited; lstat() (not stat()) means a symlink that
+     * happens to point at a directory is not followed, exactly like
+     * GNU ls -R.
+     */
+    if (recursive) {
+        for (i = 0; i < count; i++) {
+            char *path = build_path(dir, names[i]);
+            struct stat st;
+
+            if (lstat(path, &st) == 0 && S_ISDIR(st.st_mode))
+                do_ls(path, mode, 1, 1);
+            free(path);
+        }
+    }
 
     for (i = 0; i < count; i++)
         free(names[i]);
     free(names);
 }
 
-/* List a single command-line operand (file or directory). */
-static void list_operand(const char *path, enum display_mode mode)
+/* List a single command-line operand (file or directory).
+ *
+ * fw -- the column widths for a "-l" listing of plain file operands.
+ *       GNU ls stats every operand before it prints any of them, so a
+ *       file operand shares its width with the directories named on the
+ *       same command line.  It is unused (and may be NULL) for a
+ *       directory, whose contents get their own widths inside do_ls().
+ */
+static void list_operand(const char *path, enum display_mode mode,
+                         int header, int recursive, const struct widths *fw)
 {
     struct stat st;
 
@@ -550,14 +613,42 @@ static void list_operand(const char *path, enum display_mode mode)
     }
 
     if (S_ISDIR(st.st_mode)) {
-        do_ls(path, mode);
+        do_ls(path, mode, header, recursive);
     } else if (mode == MODE_LONG) {
-        struct widths w = {1, 1, 1, 1};
-        widths_from_stat(&st, &w);
-        print_long_entry(path, path, &w);
+        struct widths local = {1, 1, 1, 1};
+
+        if (fw == NULL) {
+            widths_from_stat(&st, &local);
+            fw = &local;
+        }
+        print_long_entry(path, path, fw);
+        section_started = 1;
     } else {
         printf("%s\n", path);
+        section_started = 1;
     }
+}
+
+/*
+ * v1.6.0 -- command-line operands.
+ *
+ * GNU ls sorts the operands and then prints every non-directory operand
+ * before it descends into any directory, so "ls zb aa m" lists "m" first
+ * and only then the two directories.  Keeping the same two groups makes
+ * our output line up with the real thing.
+ */
+struct operand {
+    char *path;
+    int is_dir;
+    int err;        /* 0 once stat() on the path succeeded */
+};
+
+static int compare_operands(const void *a, const void *b)
+{
+    const struct operand *oa = a;
+    const struct operand *ob = b;
+
+    return strcmp(oa->path, ob->path);
 }
 
 int main(int argc, char *argv[])
@@ -565,18 +656,21 @@ int main(int argc, char *argv[])
     int opt;
     enum display_mode mode = MODE_VERTICAL;
     int noper;
+    int recursive = 0;
 
-    while ((opt = getopt(argc, argv, "lx")) != -1) {
+    while ((opt = getopt(argc, argv, "lRx")) != -1) {
         switch (opt) {
         case 'l':
             mode = MODE_LONG;
             break;
+        case 'R':
+            recursive = 1;
+            break;
         case 'x':
-            if (mode != MODE_LONG)          /* -l takes precedence, like GNU ls */
-                mode = MODE_HORIZONTAL;
+            mode = MODE_HORIZONTAL;     /* last of -l / -x wins, like GNU ls */
             break;
         default:
-            fprintf(stderr, "Usage: %s [-l] [-x] [file ...]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [-l] [-R] [-x] [file ...]\n", argv[0]);
             return EXIT_FAILURE;
         }
     }
@@ -584,22 +678,69 @@ int main(int argc, char *argv[])
     noper = argc - optind;
 
     if (noper == 0) {
-        list_operand(".", mode);
+        list_operand(".", mode, recursive, recursive, NULL);
         return EXIT_SUCCESS;
     }
 
-    for (int i = optind; i < argc; i++) {
-        struct stat st;
-        int is_dir = (stat(argv[i], &st) == 0) && S_ISDIR(st.st_mode);
+    struct operand *ops = malloc((size_t)noper * sizeof(*ops));
+    struct widths fw = {1, 1, 1, 1};
 
-        /* GNU ls only prints a "dir:" header when several operands exist. */
-        if (noper > 1 && is_dir) {
-            if (i > optind)
-                printf("\n");
-            printf("%s:\n", argv[i]);
-        }
-        list_operand(argv[i], mode);
+    if (ops == NULL) {
+        perror("malloc");
+        return EXIT_FAILURE;
     }
 
+    /*
+     * Stat every operand up front, in the order they were written.
+     *
+     * GNU ls reports a bad path the moment it reaches it, and it knows
+     * the column widths of a "-l" file listing for all operands before
+     * it prints the first line -- a directory operand contributes its
+     * own size here, but not yet the sizes of its contents.
+     */
+    for (int i = 0; i < noper; i++) {
+        struct stat st;
+
+        ops[i].path = argv[optind + i];
+
+        if (stat(ops[i].path, &st) == -1) {
+            ops[i].err = errno;
+            ops[i].is_dir = 0;
+            continue;
+        }
+
+        ops[i].err = 0;
+        ops[i].is_dir = S_ISDIR(st.st_mode);
+        if (mode == MODE_LONG)
+            widths_from_stat(&st, &fw);
+    }
+
+    for (int i = 0; i < noper; i++)
+        if (ops[i].err != 0)
+            fprintf(stderr, "ls: cannot access '%s': %s\n",
+                    ops[i].path, strerror(ops[i].err));
+
+    qsort(ops, (size_t)noper, sizeof(*ops), compare_operands);
+
+    /* pass 0 lists the plain files, pass 1 walks the directories */
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < noper; i++) {
+            int is_dir = ops[i].is_dir;
+
+            if (ops[i].err != 0 || (pass == 1) != is_dir)
+                continue;
+
+            /*
+             * GNU ls prints a "dir:" banner for a directory operand only
+             * when several operands were given, or when -R turned every
+             * directory into a section of its own.
+             */
+            list_operand(ops[i].path, mode,
+                         is_dir && (recursive || noper > 1), recursive,
+                         (mode == MODE_LONG) ? &fw : NULL);
+        }
+    }
+
+    free(ops);
     return EXIT_SUCCESS;
 }
