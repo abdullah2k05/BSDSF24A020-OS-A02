@@ -4,6 +4,7 @@
  *
  * v1.0.0 : simple directory listing (opendir/readdir)
  * v1.1.0 : adds the -l (long listing) option
+ * v1.2.0 : default output is a multi-column (down then across) listing
  *
  * Usage:
  *       $ ./bin/ls
@@ -23,6 +24,7 @@
 #include <grp.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 
 extern int errno;
 
@@ -169,6 +171,114 @@ static void print_long_entry(const char *path, const char *name,
 }
 
 /* ------------------------------------------------------------------ */
+/* v1.2.0: column display (down then across)                           */
+/* ------------------------------------------------------------------ */
+
+/* Width of the terminal attached to stdout; 80 when it cannot be read. */
+static int get_terminal_width(void)
+{
+    struct winsize ws;
+
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+        return (int)ws.ws_col;
+    return 80;
+}
+
+/* Width of column `col` in a layout that has `num_rows` rows. */
+static size_t column_span(size_t col, size_t num_rows,
+                          char **names, size_t count)
+{
+    size_t row, best = 0;
+
+    for (row = 0; row < num_rows; row++) {
+        size_t idx = col * num_rows + row;
+        size_t len;
+
+        if (idx >= count)
+            break;
+        len = strlen(names[idx]);
+        if (len > best)
+            best = len;
+    }
+    return best;
+}
+
+/* Would a layout with `num_rows` rows still fit inside `term_width`? */
+static int layout_fits(size_t num_rows, char **names, size_t count,
+                       int term_width)
+{
+    size_t num_cols = (count + num_rows - 1) / num_rows;
+    size_t total = 0, col;
+
+    for (col = 0; col < num_cols; col++)
+        total += column_span(col, num_rows, names, count) + 2;
+
+    total -= 2;                       /* last column needs no trailing pad */
+    return total <= (size_t)term_width;
+}
+
+/*
+ * v1.2.0 -- default output: columns filled DOWN, then ACROSS.
+ *
+ * Starting point is the rule from the assignment:
+ *     num_cols = terminal_width / (longest_name + spacing)
+ *     num_rows = ceil(count / num_cols)
+ * Because real column widths depend on which names land in which column,
+ * we then try to reduce the row count (i.e. gain columns) for as long as
+ * the layout still fits the terminal -- this is what GNU ls ends up doing.
+ *
+ * Item i is printed at row = i % num_rows, col = i / num_rows.
+ */
+static void print_columnar(char **names, size_t count, size_t max_len,
+                           int term_width)
+{
+    size_t max_cols, num_rows, num_cols, row, col;
+
+    if (count == 0)
+        return;
+
+    max_cols = (size_t)term_width / (max_len + 2);   /* +2 = column spacing */
+    if (max_cols < 1)
+        max_cols = 1;
+    if (max_cols > count)
+        max_cols = count;
+
+    num_rows = (count + max_cols - 1) / max_cols;    /* ceiling division */
+    if (num_rows < 1)
+        num_rows = 1;
+
+    while (num_rows > 1 &&
+           layout_fits(num_rows - 1, names, count, term_width))
+        num_rows--;
+
+    num_cols = (count + num_rows - 1) / num_rows;
+
+    for (row = 0; row < num_rows; row++) {
+        /* right-most column that actually has an item in this row */
+        size_t last_col = 0;
+        for (col = 0; col < num_cols; col++)
+            if (col * num_rows + row < count)
+                last_col = col;
+
+        for (col = 0; col < num_cols; col++) {
+            size_t idx = col * num_rows + row;
+            size_t len;
+
+            if (idx >= count)
+                continue;
+
+            len = strlen(names[idx]);
+            fputs(names[idx], stdout);
+            if (col != last_col)
+                printf("%*s",
+                       (int)(column_span(col, num_rows, names, count) + 2 - len),
+                       "");
+        }
+        putchar('\n');
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* core directory listing                                              */
 /* ------------------------------------------------------------------ */
 
@@ -178,6 +288,7 @@ void do_ls(const char *dir, int long_format)
     DIR *dp = opendir(dir);
     char **names = NULL;
     size_t count = 0, cap = 0, i;
+    size_t max_len = 0;
     struct widths w = {1, 1, 1, 1};
     long total_blocks = 0;
 
@@ -207,6 +318,8 @@ void do_ls(const char *dir, int long_format)
             perror("strdup");
             exit(EXIT_FAILURE);
         }
+        if (strlen(names[count]) > max_len)
+            max_len = strlen(names[count]);
         count++;
     }
     if (errno != 0)
@@ -235,9 +348,8 @@ void do_ls(const char *dir, int long_format)
             print_long_entry(path, names[i], &w);
             free(path);
         }
-    } else {
-        for (i = 0; i < count; i++)
-            printf("%s\n", names[i]);
+    } else if (count > 0) {
+        print_columnar(names, count, max_len, get_terminal_width());
     }
 
     for (i = 0; i < count; i++)
