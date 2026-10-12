@@ -5,12 +5,14 @@
  * v1.0.0 : simple directory listing (opendir/readdir)
  * v1.1.0 : adds the -l (long listing) option
  * v1.2.0 : default output is a multi-column (down then across) listing
+ * v1.3.0 : adds the -x (horizontal / left-to-right) option
  *
  * Usage:
  *       $ ./bin/ls
  *       $ ./bin/ls -l
+ *       $ ./bin/ls -x
  *       $ ./bin/ls -l src
- *       $ ./bin/ls -l src Makefile
+ *       $ ./bin/ls -lx src
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,6 +29,17 @@
 #include <sys/ioctl.h>
 
 extern int errno;
+
+/*
+ * v1.3.0 -- display-mode state.
+ * One variable decides which printer runs; -l always wins over -x,
+ * which matches GNU ls.
+ */
+enum display_mode {
+    MODE_VERTICAL = 0,   /* default: columns, down then across */
+    MODE_LONG,           /* -l */
+    MODE_HORIZONTAL      /* -x */
+};
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
@@ -279,10 +292,58 @@ static void print_columnar(char **names, size_t count, size_t max_len,
 }
 
 /* ------------------------------------------------------------------ */
+/* v1.3.0: horizontal column display (-x)                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Row-major fill: print left to right and only wrap when the next name
+ * would run past the right edge of the terminal.  Columns are uniform,
+ * wide enough for the longest filename plus 2 spaces of spacing.
+ */
+static void print_horizontal(char **names, size_t count, size_t max_len,
+                             int term_width)
+{
+    size_t col_width = max_len + 2;
+    size_t pos = 0;                      /* cursor column on this line */
+    size_t i;
+
+    if (count == 0)
+        return;
+
+    for (i = 0; i < count; i++) {
+        size_t len = strlen(names[i]);
+
+        /* wrap before printing, but never emit a leading blank line */
+        if (pos > 0 && pos + len > (size_t)term_width) {
+            putchar('\n');
+            pos = 0;
+        }
+
+        fputs(names[i], stdout);
+        pos += len;
+
+        if (i + 1 < count) {
+            size_t next_col  = pos + (col_width - len);
+            size_t next_len  = strlen(names[i + 1]);
+
+            if (next_col <= (size_t)term_width &&
+                next_col + next_len <= (size_t)term_width) {
+                printf("%*s", (int)(col_width - len), "");
+                pos = next_col;
+            } else {
+                /* no room left for another column: end the line here */
+                pos = (size_t)term_width + 1;
+            }
+        }
+    }
+    putchar('\n');
+}
+
+/* ------------------------------------------------------------------ */
 /* core directory listing                                              */
 /* ------------------------------------------------------------------ */
 
-void do_ls(const char *dir, int long_format)
+void do_ls(const char *dir, enum display_mode mode)
 {
     struct dirent *entry;
     DIR *dp = opendir(dir);
@@ -291,6 +352,7 @@ void do_ls(const char *dir, int long_format)
     size_t max_len = 0;
     struct widths w = {1, 1, 1, 1};
     long total_blocks = 0;
+    int long_format = (mode == MODE_LONG);
 
     if (dp == NULL) {
         fprintf(stderr, "ls: cannot open directory '%s': %s\n",
@@ -348,6 +410,8 @@ void do_ls(const char *dir, int long_format)
             print_long_entry(path, names[i], &w);
             free(path);
         }
+    } else if (mode == MODE_HORIZONTAL) {
+        print_horizontal(names, count, max_len, get_terminal_width());
     } else if (count > 0) {
         print_columnar(names, count, max_len, get_terminal_width());
     }
@@ -358,7 +422,7 @@ void do_ls(const char *dir, int long_format)
 }
 
 /* List a single command-line operand (file or directory). */
-static void list_operand(const char *path, int long_format)
+static void list_operand(const char *path, enum display_mode mode)
 {
     struct stat st;
 
@@ -368,8 +432,8 @@ static void list_operand(const char *path, int long_format)
     }
 
     if (S_ISDIR(st.st_mode)) {
-        do_ls(path, long_format);
-    } else if (long_format) {
+        do_ls(path, mode);
+    } else if (mode == MODE_LONG) {
         struct widths w = {1, 1, 1, 1};
         widths_from_stat(&st, &w);
         print_long_entry(path, path, &w);
@@ -381,16 +445,20 @@ static void list_operand(const char *path, int long_format)
 int main(int argc, char *argv[])
 {
     int opt;
-    int long_format = 0;
+    enum display_mode mode = MODE_VERTICAL;
     int noper;
 
-    while ((opt = getopt(argc, argv, "l")) != -1) {
+    while ((opt = getopt(argc, argv, "lx")) != -1) {
         switch (opt) {
         case 'l':
-            long_format = 1;
+            mode = MODE_LONG;
+            break;
+        case 'x':
+            if (mode != MODE_LONG)          /* -l takes precedence, like GNU ls */
+                mode = MODE_HORIZONTAL;
             break;
         default:
-            fprintf(stderr, "Usage: %s [-l] [file ...]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [-l] [-x] [file ...]\n", argv[0]);
             return EXIT_FAILURE;
         }
     }
@@ -398,7 +466,7 @@ int main(int argc, char *argv[])
     noper = argc - optind;
 
     if (noper == 0) {
-        list_operand(".", long_format);
+        list_operand(".", mode);
         return EXIT_SUCCESS;
     }
 
@@ -412,7 +480,7 @@ int main(int argc, char *argv[])
                 printf("\n");
             printf("%s:\n", argv[i]);
         }
-        list_operand(argv[i], long_format);
+        list_operand(argv[i], mode);
     }
 
     return EXIT_SUCCESS;
