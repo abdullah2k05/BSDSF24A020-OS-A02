@@ -7,6 +7,7 @@
  * v1.2.0 : default output is a multi-column (down then across) listing
  * v1.3.0 : adds the -x (horizontal / left-to-right) option
  * v1.4.0 : directory entries are sorted alphabetically with qsort()
+ * v1.5.0 : filenames are colourised by file type (ANSI escape codes)
  *
  * Usage:
  *       $ ./bin/ls
@@ -20,6 +21,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <strings.h>
 #include <errno.h>
 #include <limits.h>
 #include <time.h>
@@ -28,6 +30,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
+#include <sys/sysmacros.h>
 
 extern int errno;
 
@@ -118,17 +121,31 @@ struct widths {
     int size;
 };
 
+/*
+ * The fifth column of `ls -l`: the size in bytes, or "major, minor"
+ * for character/block devices -- exactly what GNU ls prints.
+ */
+static void size_string(const struct stat *st, char *buf, size_t n)
+{
+    if (S_ISCHR(st->st_mode) || S_ISBLK(st->st_mode))
+        snprintf(buf, n, "%u, %u", major(st->st_rdev), minor(st->st_rdev));
+    else
+        snprintf(buf, n, "%ld", (long)st->st_size);
+}
+
 /* Derive the column widths of a single entry. */
 static void widths_from_stat(const struct stat *st, struct widths *w)
 {
     int n;
+    char sbuf[32];
     struct passwd *pw;
     struct group *gr;
 
     n = snprintf(NULL, 0, "%ld", (long)st->st_nlink);
     if (n > w->link) w->link = n;
 
-    n = snprintf(NULL, 0, "%ld", (long)st->st_size);
+    size_string(st, sbuf, sizeof(sbuf));
+    n = (int)strlen(sbuf);
     if (n > w->size) w->size = n;
 
     pw = getpwuid(st->st_uid);
@@ -138,6 +155,80 @@ static void widths_from_stat(const struct stat *st, struct widths *w)
     gr = getgrgid(st->st_gid);
     if (gr != NULL && (int)strlen(gr->gr_name) > w->group)
         w->group = (int)strlen(gr->gr_name);
+}
+
+/* ------------------------------------------------------------------ */
+/* v1.5.0: colourised output (ANSI escape codes)                       */
+/* ------------------------------------------------------------------ */
+
+#define COLOR_RESET   "\033[0m"     /* always turn colour back off     */
+#define COLOR_DIR     "\033[0;34m"  /* blue                            */
+#define COLOR_EXEC    "\033[0;32m"  /* green                           */
+#define COLOR_ARCHIVE "\033[0;31m"  /* red                             */
+#define COLOR_LINK    "\033[0;35m"  /* pink / magenta                  */
+#define COLOR_SPECIAL "\033[7m"     /* reverse video                   */
+
+/* Does `name` end with one of the archive suffixes? */
+static int is_archive(const char *name)
+{
+    static const char *suffixes[] = {
+        ".tar", ".gz", ".tgz", ".zip", ".bz2", ".xz", ".7z", ".rar", NULL
+    };
+    size_t len = strlen(name);
+    int i;
+
+    for (i = 0; suffixes[i] != NULL; i++) {
+        size_t sl = strlen(suffixes[i]);
+        if (len > sl && strcasecmp(name + len - sl, suffixes[i]) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* Pick the escape sequence for a name, or NULL when it stays default. */
+static const char *color_for(const char *name, mode_t mode)
+{
+    if (S_ISLNK(mode))
+        return COLOR_LINK;
+    if (S_ISDIR(mode))
+        return COLOR_DIR;
+    if (S_ISCHR(mode) || S_ISBLK(mode) || S_ISFIFO(mode) || S_ISSOCK(mode))
+        return COLOR_SPECIAL;
+    if ((mode & 0111) != 0)                 /* any execute bit set */
+        return COLOR_EXEC;
+    if (is_archive(name))
+        return COLOR_ARCHIVE;
+    return NULL;
+}
+
+/* Print `name` in the colour dictated by its st_mode. */
+static void print_colored(const char *name, mode_t mode)
+{
+    const char *color = color_for(name, mode);
+
+    if (color == NULL) {
+        fputs(name, stdout);
+        return;
+    }
+    fputs(color, stdout);
+    fputs(name, stdout);
+    fputs(COLOR_RESET, stdout);
+}
+
+/*
+ * Colour helper for the column printers: look the entry up with lstat()
+ * so we colour a symlink as a symlink rather than as its target type.
+ */
+static void put_name(const char *dir, const char *name)
+{
+    char *path = build_path(dir, name);
+    struct stat st;
+    mode_t mode = 0;
+
+    if (lstat(path, &st) == 0)
+        mode = st.st_mode;
+    print_colored(name, mode);
+    free(path);
 }
 
 /* Print one line of an "ls -l" listing. */
@@ -150,6 +241,7 @@ static void print_long_entry(const char *path, const char *name,
     const char *user, *group;
     char mode[11];
     char tbuf[32];
+    char sbuf[32];
 
     if (lstat(path, &st) == -1) {
         fprintf(stderr, "ls: cannot access '%s': %s\n", path, strerror(errno));
@@ -164,14 +256,17 @@ static void print_long_entry(const char *path, const char *name,
     group = (gr != NULL) ? gr->gr_name : "?";
 
     format_mtime(st.st_mtime, tbuf, sizeof(tbuf));
+    size_string(&st, sbuf, sizeof(sbuf));
 
-    printf("%s %*ld %-*s %-*s %*ld %s %s",
+    printf("%s %*ld %-*s %-*s %*s %s ",
            mode,
            w->link, (long)st.st_nlink,
            w->user, user,
            w->group, group,
-           w->size, (long)st.st_size,
-           tbuf, name);
+           w->size, sbuf,
+           tbuf);
+
+    print_colored(name, st.st_mode);
 
     if (S_ISLNK(st.st_mode)) {
         char target[PATH_MAX + 1];
@@ -243,8 +338,8 @@ static int layout_fits(size_t num_rows, char **names, size_t count,
  *
  * Item i is printed at row = i % num_rows, col = i / num_rows.
  */
-static void print_columnar(char **names, size_t count, size_t max_len,
-                           int term_width)
+static void print_columnar(const char *dir, char **names, size_t count,
+                           size_t max_len, int term_width)
 {
     size_t max_cols, num_rows, num_cols, row, col;
 
@@ -282,7 +377,7 @@ static void print_columnar(char **names, size_t count, size_t max_len,
                 continue;
 
             len = strlen(names[idx]);
-            fputs(names[idx], stdout);
+            put_name(dir, names[idx]);
             if (col != last_col)
                 printf("%*s",
                        (int)(column_span(col, num_rows, names, count) + 2 - len),
@@ -301,8 +396,8 @@ static void print_columnar(char **names, size_t count, size_t max_len,
  * would run past the right edge of the terminal.  Columns are uniform,
  * wide enough for the longest filename plus 2 spaces of spacing.
  */
-static void print_horizontal(char **names, size_t count, size_t max_len,
-                             int term_width)
+static void print_horizontal(const char *dir, char **names, size_t count,
+                             size_t max_len, int term_width)
 {
     size_t col_width = max_len + 2;
     size_t pos = 0;                      /* cursor column on this line */
@@ -320,7 +415,7 @@ static void print_horizontal(char **names, size_t count, size_t max_len,
             pos = 0;
         }
 
-        fputs(names[i], stdout);
+        put_name(dir, names[i]);
         pos += len;
 
         if (i + 1 < count) {
@@ -434,9 +529,9 @@ void do_ls(const char *dir, enum display_mode mode)
             free(path);
         }
     } else if (mode == MODE_HORIZONTAL) {
-        print_horizontal(names, count, max_len, get_terminal_width());
+        print_horizontal(dir, names, count, max_len, get_terminal_width());
     } else if (count > 0) {
-        print_columnar(names, count, max_len, get_terminal_width());
+        print_columnar(dir, names, count, max_len, get_terminal_width());
     }
 
     for (i = 0; i < count; i++)
